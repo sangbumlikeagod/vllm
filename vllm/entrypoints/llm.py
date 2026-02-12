@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import math
+import uuid
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, Dict
 
 import cloudpickle
+import numpy as np
 import torch.nn as nn
 from pydantic import ValidationError
 from tqdm.auto import tqdm
@@ -428,7 +431,7 @@ class LLM:
         # Add any modality specific loras to the corresponding prompts
         lora_request = self._get_modality_specific_lora_reqs(prompts, lora_request)
 
-        self._validate_and_add_requests(
+        requested_prompts = self._validate_and_add_requests(
             prompts=prompts,
             params=sampling_params,
             use_tqdm=use_tqdm,
@@ -437,7 +440,12 @@ class LLM:
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        return self.engine_class.validate_outputs(outputs, RequestOutput)
+        concated_outputs = self._merge_mm_audio_data(
+            requested_prompts,
+            outputs,
+        )
+
+        return self.engine_class.validate_outputs(concated_outputs, RequestOutput)
 
     def _get_modality_specific_lora_reqs(
         self,
@@ -1580,7 +1588,7 @@ class LLM:
         lora_request: Sequence[LoRARequest] | LoRARequest | None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> Sequence[PromptType]:
         if isinstance(prompts, (str, dict)):
             # Convert a single prompt to a list.
             prompts = [prompts]  # type: ignore[list-item]
@@ -1613,21 +1621,56 @@ class LLM:
         added_request_ids: list[str] = []
 
         try:
+            # Try Segmentation for Audio MultiModal Prompt which audio length > 30s
+            segmented_prompts = []
+            adjusted_param_index = []
             for i, prompt in enumerate(it):
                 if isinstance(prompt, dict):
+                    mm_data : dict[str, Any] = prompt.get("multi_modal_data")
+                    mm_uuids : dict[str, Any] = prompt.get("multi_modal_uuids")
+
                     self._validate_mm_data_and_uuids(
-                        prompt.get("multi_modal_data"), prompt.get("multi_modal_uuids")
+                        mm_data, mm_uuids
                     )
+                    if mm_data.get("audio"):
+                        chunked_list = self._preprocess_mm_audio_data(
+                            mm_data.get("audio")
+                        )
+                        # Identify uuid to concatenate later
+                        if mm_uuids and mm_uuids.get("audio"):
+                            uuids = mm_uuids
+                        else:
+                            uuids = {"audio": [str(uuid.uuid4())]}
+
+                        for item in chunked_list:
+                            segment = prompt.copy()
+                            segment.get("multi_modal_data")["audio"] = [item]
+                            segment["multi_modal_uuids"] = uuids
+                            segmented_prompts.append(segment)
+                            adjusted_param_index.append(i)
+                    else:
+                        segmented_prompts.append(prompt)
+                        adjusted_param_index.append(i)
+                else:
+                    segmented_prompts.append(prompt)
+                    adjusted_param_index.append(i)
+
+            it = segmented_prompts if len(segmented_prompts) > len(prompts) else prompts
+
+            for i, prompt in enumerate(it):
                 request_id = self._add_request(
                     prompt,
-                    params[i] if isinstance(params, Sequence) else params,
-                    lora_request=lora_request[i]
+                    params[adjusted_param_index[i]]
+                    if isinstance(params, Sequence)
+                    else params,
+                    lora_request=lora_request[adjusted_param_index[i]]
                     if isinstance(lora_request, Sequence)
                     else lora_request,
-                    priority=priority[i] if priority else 0,
+                    priority=priority[adjusted_param_index[i]] if priority else 0,
                     tokenization_kwargs=tokenization_kwargs,
                 )
                 added_request_ids.append(request_id)
+            return it
         except Exception as e:
             if added_request_ids:
                 self.llm_engine.abort_request(added_request_ids, internal=True)
@@ -1680,6 +1723,100 @@ class LLM:
                         f"Multi-modal data for {modality} is None"
                         f" but UUID is not provided"
                     )
+
+    def _preprocess_mm_audio_data(
+        self,
+        audio_data: Any | None,
+    ):
+        MAX_AUDIO_LEN = 30
+        chunked_list = []
+        for d in audio_data:
+            audio, samplerate = d
+            if audio.shape[0] > MAX_AUDIO_LEN * samplerate:
+                result = self._chunk_audio_data(audio, samplerate)
+                chunked_list.extend((result, samplerate))
+            else:
+                chunked_list.append((audio, samplerate))
+        return chunked_list
+
+    def _chunk_audio_data(
+        self, audio_data: np.ndarray, sample_rate: int
+    ) -> list[np.ndarray]:
+        MAX_AUDIO_LEN = 30
+        chunk_size = sample_rate * MAX_AUDIO_LEN
+        overlap_size = sample_rate
+        chunks = []
+        i = 0
+        while i < audio_data.shape[-1]:
+            if i + chunk_size >= audio_data.shape[-1]:
+                # handle last chunk
+                chunks.append(audio_data[..., i:])
+                break
+
+            # Find the best split point in the overlap region
+            search_start = i + chunk_size - overlap_size
+            search_end = min(i + chunk_size, audio_data.shape[-1])
+            split_point = self._find_split_point(audio_data, search_start, search_end)
+            # Extract chunk up to the split point
+            chunks.append(audio_data[..., i:split_point])
+            i = split_point
+
+        return chunks
+
+    def _find_split_point(
+        self, wav: np.ndarray, start_idx: int, end_idx: int, samplerate: int
+    ) -> int:
+        """Find the best point to split audio by
+        looking for silence or low amplitude.
+        Args:
+            wav: Audio tensor [1, T]
+            start_idx: Start index of search region
+            end_idx: End index of search region
+        Returns:
+            Index of best splitting point
+        """
+        segment = wav[start_idx:end_idx]
+
+        # Calculate RMS energy in small windows
+        min_energy = math.inf
+        quietest_idx = 0
+        min_energy_window = samplerate // 10
+        assert min_energy_window is not None
+        for i in range(0, len(segment) - min_energy_window, min_energy_window):
+            window = segment[i : i + min_energy_window]
+            energy = (window**2).mean() ** 0.5
+            if energy < min_energy:
+                quietest_idx = i + start_idx
+                min_energy = energy
+        return quietest_idx
+
+    def _merge_mm_audio_data(
+        self,
+        prompts: Sequence[PromptType],
+        outputs: list[RequestOutput | Any],
+    ) -> Sequence[PromptType]:
+        assert len(prompts) == len(outputs), "Sizes of inputs and outputs don't match."
+        concated_outputs: list[Any] = []
+        it = prompts
+        for i, prompt in enumerate(it):
+            if (
+                isinstance(prompt, dict) 
+                and prompt.get("multi_modal_data").get("audio")
+                and prompt.get("multi_modal_uuids")
+                and prompt.get("multi_modal_uuids").get("audio")
+                and i != 0
+                and it[i - 1].get("multi_modal_uuids").get("audio")[0]
+                == prompt.get("multi_modal_uuids").get("audio")[0]
+            ):
+                concated_outputs[-1].outputs[0].token_ids.extend(
+                    outputs[i].outputs[0].token_ids
+                )
+                concated_outputs[-1].outputs[0].text += (
+                    outputs[i].outputs[0].text
+                )
+                continue
+            concated_outputs.append(outputs[i])
+        return concated_outputs
 
     def _process_inputs(
         self,
